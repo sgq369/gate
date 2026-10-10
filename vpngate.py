@@ -74,6 +74,10 @@ PROBE_TIMEOUT = 4          # 单次探测超时（秒）
 PROBE_WORKERS = 32         # 并发探测数
 MAX_DIRECT = 24            # 直连优选节点上限
 MAX_HOME = 12              # 家宽（SSTP 链式）节点上限
+# 家宽优选国家（按优先级排序）：每个国家最多取 HOME_PER_COUNTRY 个，
+# 保证多国家覆盖且 US 必含（若有可用）。不足 MAX_HOME 时按延迟补足。
+HOME_PREFERRED_CC = ["US", "JP", "KR", "SG", "DE", "GB", "CA", "AU", "NL", "FR"]
+HOME_PER_COUNTRY = 2
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
@@ -219,7 +223,8 @@ def fetch_vpngate():
         return []
     rows.sort(reverse=True)
     log(f"VPN Gate 取到 {len(rows)} 个候选服务器")
-    return [(ip, cc) for _, ip, cc in rows[:40]]
+    # 取前 120 做候选（多国家覆盖，不能只按分数截断到 40）
+    return [(ip, cc) for _, ip, cc in rows[:120]]
 
 
 def check_sstp_alive(host):
@@ -275,6 +280,33 @@ def vless_link(ip, port, raw_path, remark):
     return f"vless://{EDT_UUID}@{ip}:{port}?{q}#{quote(remark, safe='')}"
 
 
+def pick_home_nodes(home_nodes):
+    """多国家优选家宽节点：优先国家按 HOME_PREFERRED_CC 顺序、
+    每个国家取延迟最低的 HOME_PER_COUNTRY 个（US 优先保证）；
+    不足 MAX_HOME 时按延迟从其余国家补足。"""
+    by_cc = {}
+    for n in home_nodes:
+        by_cc.setdefault(n[1], []).append(n)
+    for lst in by_cc.values():
+        lst.sort(key=lambda x: x[2])
+    picked, seen = [], set()
+    for cc in HOME_PREFERRED_CC:
+        for n in by_cc.get(cc, [])[:HOME_PER_COUNTRY]:
+            if len(picked) >= MAX_HOME:
+                break
+            picked.append(n)
+            seen.add(n[0])
+        if len(picked) >= MAX_HOME:
+            break
+    if len(picked) < MAX_HOME:
+        rest = sorted((n for n in home_nodes if n[0] not in seen),
+                      key=lambda x: x[2])
+        picked.extend(rest[:MAX_HOME - len(picked)])
+    ccs = sorted({n[1] for n in picked})
+    log(f"家宽国家分布：{', '.join(ccs)}")
+    return picked
+
+
 # ---------------------------------------------------------------- 主流程 ----
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -306,7 +338,7 @@ def main():
                 if lat is not None:
                     home_nodes.append((ip, cc, lat))
         home_nodes.sort(key=lambda x: x[2])
-        home_nodes = home_nodes[:MAX_HOME]
+        home_nodes = pick_home_nodes(home_nodes)
         log(f"家宽 SSTP 存活 {len(home_nodes)} 个")
     else:
         log("VPN Gate 不可用，本次只输出优选直连节点")
